@@ -1,0 +1,13 @@
+langchain
+langchain_anthropic
+langchain_community
+langchain_text_splitters
+langchain_huggingface
+langchain-chroma
+sentence-transformers
+pypdf
+docx2txt
+python-dotenv
+fastapi
+uvicorn
+pydantic
