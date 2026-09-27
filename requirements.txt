@@ -4,6 +4,7 @@ langchain_community
 langchain_text_splitters
 langchain_huggingface
 langchain-chroma
+langchain-core
 sentence-transformers
 pypdf
 docx2txt

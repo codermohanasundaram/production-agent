@@ -1,14 +1,27 @@
 """
 Generation: build a grounded prompt from retrieved chunks and call the LLM.
 
-WHY MODEL SELECTION MOVED FROM A FIXED MODEL TO model_router:
-generate_answer() now asks model_router.select_model() which model to use
-PER QUESTION, based on the question's classified complexity, instead of
-always using config.LLM_MODEL_NAME. After the response comes back, actual
-token usage from the API response is used to compute and log real cost -
-not an estimate made in advance, but what the call actually cost.
+WHY THIS FILE NOW USES LCEL (LangChain Expression Language):
+Previously build_prompt() was a raw f-string and get_llm().invoke(prompt)
+was called manually - functionally correct, but hand-rolled instead of
+using LangChain's own composition layer. This version uses
+ChatPromptTemplate (validates variables, supports future few-shot/system
+message additions) piped into ChatAnthropic via the `|` operator - the
+same `prompt | llm` pattern LangChain's own docs and examples use.
+
+WHY MODEL ROUTING IS STILL DONE OUTSIDE A SINGLE STATIC CHAIN:
+A textbook LCEL chain is built once and reused: `chain = prompt | llm`.
+But here, WHICH model to use depends on the classified complexity of
+THIS SPECIFIC question - it's a runtime decision, not something knowable
+when the module loads. The standard LCEL pattern for this ("route to a
+different chain/config per call based on a runtime classification") is a
+RunnableLambda that builds and invokes the right sub-chain on each call -
+see generate_answer() below. The `prompt | llm` composition itself is
+still genuine LCEL; it's just constructed fresh per call with whichever
+model was routed to, rather than being one fixed global object.
 """
 from langchain_anthropic import ChatAnthropic
+from langchain_core.prompts import ChatPromptTemplate
 
 import config
 import model_router
@@ -48,8 +61,15 @@ def build_context(documents) -> str:
     return "\n".join(contexts)  # now outside the loop - uses ALL retrieved documents
 
 
-def build_prompt(context: str, question: str) -> str:
-    return f"""You are a production support assistant.
+# WHY A MODULE-LEVEL ChatPromptTemplate INSTEAD OF A build_prompt() FUNCTION:
+# ChatPromptTemplate.from_template() parses {context}/{question} as named
+# input variables ONCE, at import time, and validates them on every
+# .invoke() call - a typo'd variable name now fails fast with a clear
+# error instead of silently producing a prompt with a literal "{context}"
+# in it. It's also directly composable with `| llm` below, which a plain
+# f-string function isn't.
+PROMPT_TEMPLATE = ChatPromptTemplate.from_template(
+    """You are a production support assistant.
 
 Answer the user's question using ONLY the provided context.
 
@@ -66,28 +86,28 @@ Context:
 Question:
 {question}
 """
+)
 
 
 def get_llm(model_name: str) -> ChatAnthropic:
     """
     Build the Anthropic chat client for a specific model.
 
-    WHY model_name IS NOW A PARAMETER INSTEAD OF ALWAYS config.LLM_MODEL_NAME:
-    Different questions now route to different models (see model_router.py),
+    WHY model_name IS A PARAMETER INSTEAD OF ALWAYS config.LLM_MODEL_NAME:
+    Different questions route to different models (see model_router.py),
     so this needs to build a client for WHICHEVER model was selected for
     this particular call, not a single hardcoded one.
 
     WHY max_retries IS SET EXPLICITLY:
-    Your original code didn't set this, so a transient network blip or a
-    momentary rate limit would fail the whole request immediately. Setting
-    max_retries gives the client a chance to recover from transient errors
-    on its own before surfacing a failure to the caller - standard
-    resilience practice for any external API call in a production path.
+    A transient network blip or momentary rate limit would otherwise fail
+    the whole request immediately. max_retries gives the client a chance
+    to recover on its own - standard resilience practice for any external
+    API call in a production path.
 
-    Note: the API key itself now comes from config.ANTHROPIC_API_KEY, which
-    fails loudly and early (at import time, in config.py) with a clear
-    message if the key is missing or empty - instead of failing deep inside
-    the Anthropic SDK's internals the way your original TypeError did.
+    Note: the API key comes from config.ANTHROPIC_API_KEY, which fails
+    loudly and early (at import time, in config.py) with a clear message
+    if it's missing or empty - instead of failing deep inside the
+    Anthropic SDK's internals the way the original bug did.
     """
     return ChatAnthropic(
         model=model_name,
@@ -99,24 +119,34 @@ def get_llm(model_name: str) -> ChatAnthropic:
 
 def generate_answer(context: str, question: str) -> dict:
     """
-    Generate an answer, routing to a complexity-appropriate model and
-    logging the actual cost of the call.
+    Generate an answer via an LCEL chain (prompt | llm), routing to a
+    complexity-appropriate model and logging the actual cost of the call.
 
-    WHY THIS NOW RETURNS A dict INSTEAD OF JUST response.content:
-    Previously this returned only the answer text. Now that different
-    calls can use different models at different prices, callers (and you,
-    reading logs) need visibility into WHICH model answered and WHAT it
-    cost - not just the answer itself. rag_pipeline.py and main.py are
-    updated to read result["answer"] instead of using the return value
-    directly as a string.
+    WHY THIS BUILDS `prompt | llm` HERE RATHER THAN AT MODULE LOAD:
+    The model (and therefore the llm object piped into the chain) isn't
+    known until model_router classifies THIS question. So the LCEL chain
+    itself is constructed per-call, using whichever model was routed to -
+    still a real `prompt | llm` composition, just not a single global
+    chain reused unchanged across every request the way a fixed-model
+    setup could do.
+
+    WHY THE CHAIN DOESN'T END IN StrOutputParser():
+    A typical LCEL chain adds `| StrOutputParser()` to unwrap the final
+    AIMessage down to a plain string. That would lose access to
+    response.usage_metadata (the real token counts used for cost tracking
+    below) - StrOutputParser discards everything on the message except
+    its text. Since exact cost tracking is a hard requirement here, the
+    chain intentionally stops at the raw AIMessage and .content is read
+    off manually afterward, right where usage_metadata is also read.
     """
     model_name = model_router.select_model(question, context)
-    prompt = build_prompt(context, question)
-    logger.debug(f"Prompt sent to LLM:\n{prompt}")  # debug-level: hidden by default
-
     llm = get_llm(model_name)
+
+    chain = PROMPT_TEMPLATE | llm  # <-- the LCEL composition
+
+    logger.debug(f"Invoking chain for model {model_name}")  # debug-level: hidden by default
     logger.info(f"Calling {model_name}")
-    response = llm.invoke(prompt)
+    response = chain.invoke({"context": context, "question": question})
 
     # WHY ACTUAL usage_metadata INSTEAD OF ESTIMATING TOKENS OURSELVES:
     # langchain_anthropic populates response.usage_metadata with the real
