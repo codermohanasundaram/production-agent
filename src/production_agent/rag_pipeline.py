@@ -17,12 +17,27 @@ Same reasoning as before this refactor: this is the seam between
 main.py and api.py both call answer_question() without knowing or caring
 that it's now backed by an LCEL chain internally - the external contract
 (a question in, a dict out) hasn't changed.
+
+NOTE ON SELECTION ORDER vs DISPLAY ORDER (post-reranking):
+_retrieve_step selects and orders chunks by CROSS-ENCODER relevance
+(reranking.py) - that's the order the LLM sees in its context, and it's
+the more accurate judgment of "which chunks actually answer this
+question". _generate_step, when building the "sources" list for display,
+re-sorts by the ORIGINAL COSINE score instead. This isn't a second
+opinion overriding the first - selection was already finalized by the
+cross-encoder before this sort happens. It's purely so the confidence
+labels shown to a user read consistently top-to-bottom (highest
+confidence first), since cross-encoder rank order and cosine-score order
+aren't the same thing and showing sources in cross-encoder order while
+labeling them with cosine confidence produced a visibly inconsistent
+list (a "Good match" listed above a "Strong match").
 """
 from langchain_core.runnables import RunnableLambda
 
 import config
 from logging_setup import get_logger
-from retrieval import retrieve_with_scores
+from retrieval import retrieve_with_scores, interpret_confidence
+from reranking import rerank
 from generation import build_context, generate_answer
 
 logger = get_logger(__name__)
@@ -30,7 +45,7 @@ logger = get_logger(__name__)
 
 def _retrieve_step(inputs: dict) -> dict:
     """
-    LCEL stage 1: retrieve scored chunks and assemble context.
+    LCEL stage 1: retrieve candidates, rerank them, assemble context.
 
     WHY A dict IN, dict OUT (not question: str -> list[Document]):
     LCEL steps composed with `|` pass ONE value from each step to the
@@ -39,11 +54,26 @@ def _retrieve_step(inputs: dict) -> dict:
     steps in the chain read whichever earlier fields they need (question,
     k, scored_results, context) without every step's signature having to
     change when a new field is added.
+
+    WHY TWO RETRIEVAL CALLS HAPPEN HERE (candidate pool, then rerank):
+    retrieve_with_scores() is called with config.RERANK_CANDIDATE_K (wider
+    than the final k) so there's an actual pool for the cross-encoder to
+    choose from - reranking a pool that's already been narrowed to exactly
+    k could only ever reorder what cosine already picked, never surface a
+    chunk cosine ranked just outside the top k. rerank() then narrows that
+    wider pool down to the requested k using the more accurate joint
+    (question, chunk) scoring - see reranking.py for the full reasoning.
     """
     question = inputs["question"]
     k = inputs.get("k", config.RETRIEVAL_K)
 
-    scored_results = retrieve_with_scores(question, k=k)
+    if config.RERANK_ENABLED:
+        candidate_k = max(config.RERANK_CANDIDATE_K, k)
+        candidates = retrieve_with_scores(question, k=candidate_k)
+        scored_results = rerank(question, candidates, top_k=k)
+    else:
+        scored_results = retrieve_with_scores(question, k=k)
+
     context = build_context([doc for doc, _ in scored_results]) if scored_results else ""
 
     return {"question": question, "scored_results": scored_results, "context": context}
@@ -78,6 +108,7 @@ def _generate_step(inputs: dict) -> dict:
             "output_tokens": 0,
             "cost_usd": 0.0,
             "retrieval_confidence": 0.0,
+            "retrieval_confidence_label": interpret_confidence(0.0),
         }
 
     # WHY AVERAGE THE PER-CHUNK SCORES INTO ONE NUMBER:
@@ -89,6 +120,20 @@ def _generate_step(inputs: dict) -> dict:
 
     generation_result = generate_answer(inputs["context"], inputs["question"])
 
+    # WHY SORTED HERE, SEPARATELY FROM scored_results USED ABOVE:
+    # scored_results is in CROSS-ENCODER rank order (reranking.py's whole
+    # point - the best joint-relevance match first, which is what should
+    # drive WHICH chunks got selected and in what order the LLM saw them
+    # in the context). But the confidence LABEL shown per source is still
+    # the ORIGINAL cosine score (see interpret_confidence()'s calibration
+    # note) - and cross-encoder order doesn't track cosine order. Without
+    # this, a user could see "Good match" listed above "Strong match",
+    # which reads as inconsistent even though nothing is actually wrong.
+    # Sorting HERE, for display only, fixes the readability issue without
+    # touching selection or what the LLM was given - generation_result
+    # above was already computed from the cross-encoder-ordered context.
+    sources_for_display = sorted(scored_results, key=lambda item: item[1], reverse=True)
+
     return {
         "answer": generation_result["answer"],
         "model": generation_result["model"],
@@ -96,14 +141,16 @@ def _generate_step(inputs: dict) -> dict:
         "output_tokens": generation_result["output_tokens"],
         "cost_usd": generation_result["cost_usd"],
         "retrieval_confidence": retrieval_confidence,
+        "retrieval_confidence_label": interpret_confidence(retrieval_confidence),
         "sources": [
             {
                 "source": doc.metadata.get("source"),
                 "page": doc.metadata.get("page"),
                 "content": doc.page_content,
                 "relevance_score": score,
+                "relevance_label": interpret_confidence(score),
             }
-            for doc, score in scored_results
+            for doc, score in sources_for_display
         ],
     }
 

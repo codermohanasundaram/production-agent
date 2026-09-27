@@ -102,6 +102,59 @@ VECTOR_DISTANCE_METRIC = "cosine"
 # --- Retrieval -------------------------------------------------------------
 RETRIEVAL_K = 3
 
+# WHY THIS CONSTANT WAS ADDED:
+# Raw cosine relevance scores from EMBEDDING_MODEL_NAME have consistently
+# landed in the 0.42-0.48 range for CONFIRMED GOOD matches throughout
+# testing (multiple different questions, all verified against ground
+# truth). Shown as a bare percentage, "45%" reads as mediocre/uncertain
+# to anyone unfamiliar with this embedding model's actual score
+# distribution - when it's actually representative of a strong match for
+# this model. These bands translate the raw score into a label calibrated
+# against what THIS embedding model's "good" actually looks like, instead
+# of against generic percentage intuition (where 45% suggests "worse than
+# a coin flip", which is the wrong read here).
+#
+# CAVEAT - THIS IS A PROVISIONAL CALIBRATION, NOT A MEASURED ONE:
+# All observations so far are from CONFIRMED-RELEVANT retrievals - every
+# test question so far has returned genuinely on-topic chunks. There is
+# no data yet on what a confirmed-IRRELEVANT match scores with this
+# model, so the lower bands (WEAK/VERY_WEAK below) are reasonable
+# starting guesses, not measurements. Revisit these thresholds once
+# you've observed some clearly-bad retrievals (e.g. asking a question
+# with no relevant log data present) and noted where their scores land.
+#
+# Ordered highest-to-lowest; retrieval.interpret_confidence() walks this
+# list and returns the first band whose threshold the score meets.
+CONFIDENCE_BANDS = [
+    (0.45, "Strong match"),
+    (0.35, "Good match"),
+    (0.20, "Weak match - verify sources"),
+    (0.00, "Very weak - likely no relevant data"),
+]
+
+# --- Reranking -------------------------------------------------------------
+# WHY RERANKING WAS ADDED:
+# Cosine similarity compares PRE-COMPUTED embeddings - the question's
+# embedding and each chunk's embedding were computed independently, at
+# different times, without ever "looking at" each other together. That's
+# what makes it cheap (no recomputation per query), and also what caps
+# its precision. A cross-encoder scores (question, chunk) as a SINGLE
+# joint input, which is consistently more accurate - at the cost of one
+# model inference per candidate, too slow to run against a whole
+# collection but cheap against a small shortlist. See reranking.py for
+# the full mechanics.
+RERANK_ENABLED = True
+RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+# WHY THIS IS LARGER THAN RETRIEVAL_K:
+# Reranking needs a wider candidate pool to actually improve on cosine's
+# top-k - if you only ever pulled the same k candidates cosine would have
+# returned anyway, reranking could only reorder them, never surface a
+# genuinely better chunk that cosine ranked just outside the top k. Pull
+# more candidates cheaply via cosine, then let the more accurate
+# cross-encoder pick the real top RETRIEVAL_K from that wider pool.
+RERANK_CANDIDATE_K = 15
+
 # --- LLM ---------------------------------------------------------------
 # WHY THREE MODELS INSTEAD OF ONE:
 # Your original code called one fixed model ("claude-sonnet-4-5") for every

@@ -85,12 +85,21 @@ def main():
     # retrieval matched the question (see the honesty note in
     # retrieval.py's retrieve_with_scores() docstring - this is a
     # RETRIEVAL match score, not an answer-correctness score).
+    #
+    # WHY THE LABEL LEADS AND THE RAW % IS NOW SECONDARY (reversed from
+    # before): a bare "45.2%" reads as mediocre by generic percentage
+    # intuition, when it's actually this embedding model's typical score
+    # for a CONFIRMED GOOD match (see config.CONFIDENCE_BANDS). Leading
+    # with the calibrated label ("Strong match") and keeping the raw
+    # number as parenthetical detail fixes the misread without hiding the
+    # underlying number for anyone who wants it.
     if result.get("model"):
         print(
             f"\n(model: {result['model']} | "
             f"tokens: {result['input_tokens']} in / {result['output_tokens']} out | "
             f"cost: ${result['cost_usd']:.6f} | "
-            f"retrieval confidence: {result['retrieval_confidence'] * 100:.1f}%)"
+            f"retrieval confidence: {result['retrieval_confidence_label']} "
+            f"({result['retrieval_confidence'] * 100:.1f}%))"
         )
 
     print("\n" + "=" * 70)
@@ -99,7 +108,7 @@ def main():
     for i, src in enumerate(result["sources"], 1):
         page = src["page"] if src["page"] is not None else "N/A"  # non-PDF sources (txt/docx) have no page number
         score_pct = src["relevance_score"] * 100
-        print(f"\n[{i}] {src['source']} (page {page}) - relevance: {score_pct:.1f}%")
+        print(f"\n[{i}] {src['source']} (page {page}) - {src['relevance_label']} ({score_pct:.1f}%)")
         print(src["content"])
 
 

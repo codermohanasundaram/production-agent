@@ -9,6 +9,8 @@ embedded) and reconnects to the persisted vector store on disk. This is
 what makes querying cheap: no PDF parsing, no re-chunking, no rewriting
 the vector store - just reading from it.
 """
+import threading
+
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 
@@ -17,10 +19,35 @@ from logging_setup import get_logger
 
 logger = get_logger(__name__)
 
+# WHY A MODULE-LEVEL CACHE FOR THE VECTOR STORE (THIS FIXES A REAL BUG):
+# get_vector_store() previously constructed a NEW HuggingFaceEmbeddings
+# instance - reloading the embedding model's weights from disk - on
+# EVERY call, and it's called once per retrieve_with_scores() call, i.e.
+# once per QUESTION. This is exactly the cost reranking.py's _reranker
+# cache was built to avoid for the cross-encoder ("loading a model means
+# loading weights from disk/HF cache - real, measurable latency...
+# reused across calls") - that reasoning was just never applied here.
+# It was masked in CLI testing by a warm OS file cache (fast on a local
+# machine that had just run ingestion moments before), but with api.py
+# now handling live requests, this meant every single incoming HTTP
+# request would pay a full model-reload cost that should only happen
+# once, at process startup.
+#
+# WHY A threading.Lock, NOT JUST "if _vector_store is None":
+# A bare None-check has a race condition under concurrent requests - two
+# simultaneous first-requests (real once this runs as a multi-worker
+# FastAPI service) could both see None and both trigger a load. The lock
+# makes the check-and-set atomic, so only one thread ever actually builds
+# the client; every other concurrent caller just waits briefly and then
+# gets the cached instance.
+_vector_store: Chroma | None = None
+_vector_store_lock = threading.Lock()
+
 
 def get_vector_store() -> Chroma:
     """
-    Reconnect to the persisted Chroma collection.
+    Reconnect to the persisted Chroma collection - once per process, not
+    once per call.
 
     WHY THIS FUNCTION EXISTS:
     Your original code only ever built the vector store via
@@ -38,13 +65,28 @@ def get_vector_store() -> Chroma:
     connects to a collection that doesn't exist yet, it's created with the
     correct metric rather than defaulting to L2.
     """
-    embeddings = HuggingFaceEmbeddings(model_name=config.EMBEDDING_MODEL_NAME)
-    return Chroma(
-        persist_directory=config.CHROMA_PERSIST_DIR,
-        embedding_function=embeddings,
-        collection_name=config.COLLECTION_NAME,
-        collection_metadata={"hnsw:space": config.VECTOR_DISTANCE_METRIC},
-    )
+    global _vector_store
+    if _vector_store is None:
+        with _vector_store_lock:
+            if _vector_store is None:  # re-check: another thread may have built it while this one waited for the lock
+                logger.info(f"Loading embedding model: {config.EMBEDDING_MODEL_NAME}")
+                embeddings = HuggingFaceEmbeddings(model_name=config.EMBEDDING_MODEL_NAME)
+                _vector_store = Chroma(
+                    persist_directory=config.CHROMA_PERSIST_DIR,
+                    embedding_function=embeddings,
+                    collection_name=config.COLLECTION_NAME,
+                    collection_metadata={"hnsw:space": config.VECTOR_DISTANCE_METRIC},
+                )
+    # WHY THIS CACHE DOESN'T GO STALE WHEN NEW DOCUMENTS ARE INGESTED
+    # LATER IN THE SAME PROCESS (e.g. api.py's /ingest endpoint, called
+    # after /query has already warmed this cache): the cached object is a
+    # CLIENT connected to the on-disk persist_directory, not a snapshot of
+    # its contents - Chroma reads from disk per query. ingestion.py writes
+    # to that same directory/collection through its own separate Chroma
+    # client. So a query after a later ingestion still sees the new data;
+    # only the embedding MODEL and the client WRAPPER are being reused
+    # here, not a frozen copy of the collection's contents.
+    return _vector_store
 
 
 def retrieve(query: str, k: int = config.RETRIEVAL_K):
@@ -100,3 +142,30 @@ def retrieve_with_scores(query: str, k: int = config.RETRIEVAL_K):
     scored = vector_db.similarity_search_with_relevance_scores(query, k=k)
     logger.info(f"Retrieved {len(scored)} chunk(s) with scores")
     return scored
+
+
+def interpret_confidence(score: float) -> str:
+    """
+    Translate a raw cosine relevance score into a calibrated label, using
+    config.CONFIDENCE_BANDS.
+
+    WHY THIS FUNCTION EXISTS:
+    A raw score like 0.452 reads as "worse than a coin flip" to anyone
+    going by generic percentage intuition - but for EMBEDDING_MODEL_NAME,
+    0.42-0.48 has been this project's consistent score for CONFIRMED GOOD
+    matches across every test question so far. The number itself wasn't
+    wrong; showing it as a bare percentage with no context was misleading.
+    This maps the same raw score to a label calibrated against what this
+    specific model's "good" actually looks like.
+
+    WHY THE BANDS THEMSELVES LIVE IN config.py, NOT HERE:
+    Same reasoning as CHUNK_SIZE, MODEL_PRICING, etc: this is a tunable
+    threshold, not fixed logic. As you gather more retrieval results
+    (especially confirmed-BAD matches, which no test has produced yet -
+    see the caveat on CONFIDENCE_BANDS in config.py) you'll want to
+    adjust the thresholds without touching this function's code.
+    """
+    for threshold, label in config.CONFIDENCE_BANDS:
+        if score >= threshold:
+            return label
+    return config.CONFIDENCE_BANDS[-1][1]  # fallback: lowest band's label
